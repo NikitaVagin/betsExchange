@@ -2,32 +2,52 @@
 pragma solidity =0.8.4;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
-import './libs/strings.sol';
+import { IOptimisticOracle } from "./interfaces/IOptimisticOracle.sol";
+import { IUmaFinder } from "./interfaces/IUmaFinder.sol";
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
 import "./interfaces/IOracle.sol";
 import "./interfaces/IMatch.sol";
-import "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
 
 
-contract Oracle is IOracle, Ownable, ChainlinkClient {
-    using Chainlink for Chainlink.Request;
-    using strings for *;
+contract Oracle is IOracle, Ownable {
 
     uint256 constant REQUEST_TIME = 100;
-    bytes32 constant CANCELED = '0x63616e63656c6564';
+    bytes32 public constant IDENTIFIER = "YES_OR_NO_QUERY";
 
-    address public nodeOracle; 
-    bytes32 public jobId;
-    uint256 public nodeFee;
-    string public apiBase;
-    string public path;
-    string private apiToken;
-
-    uint8 constant LOL_ID = 1;
-    uint8 constant CS_ID = 3;
-    uint8 constant DOTA_ID = 4;
+    /// @notice UMA Finder address
+    address public umaFinder;
 
     uint256 public liveness;
-    uint256 public bond;
+    uint256 public pledge;
+    uint256 public blockAmount;
+    uint256 public availableAmount;
+
+      struct QuestionData {
+        // Unix timestamp(in seconds) at which a market can be resolved
+        uint256 resolutionTime;
+        // Reward offered to a successful proposer
+        uint256 reward;
+        // Additional bond required by Optimistic oracle proposers and disputers
+        uint256 proposalBond;
+        // Flag marking the block number when a question was settled
+        uint256 settled;
+        // Request timestmap, set when a request is made to the Optimistic Oracle
+        uint256 requestTimestamp;
+        // Admin Resolution timestamp, set when a market is flagged for admin resolution
+        uint256 adminResolutionTimestamp;
+        // Flag marking whether a question can be resolved early
+        bool earlyResolutionEnabled;
+        // Flag marking whether a question is resolved
+        bool resolved;
+        // Flag marking whether a question is paused
+        bool paused;
+        // ERC20 token address used for payment of rewards, proposal bonds and fees
+        address rewardToken;
+        // Data used to resolve a condition
+        bytes ancillaryData;
+    }
+
 
 
     IMatch matchContract;
@@ -35,31 +55,29 @@ contract Oracle is IOracle, Ownable, ChainlinkClient {
      enum State {
         None,
         Requested,
-        Proposed,
+        ProposedOrExpired,
         Expired,
         Disputed,
         Resolved,
-        Settled,
-        Failed
+        Settled
     }
 
     // Struct representing a price request.
     struct Event {
-        address disputer; // Address of the disputer.
-        bool settled; // True if the request is settled.
+        uint256 estimatedStartTime;
+        uint256 resolutionTime;
+        uint256 reward;
+        uint256 proposalBond;
+        uint256 settled;
+        address disputer;
+        uint256 requestTimestamp;
+        uint256 proposedTimestamp;
         bool refundOnDispute; // True if the requester should be refunded their reward on dispute.
-        bool callback;
-        bool disputerIsRight; //todo: rename
-        uint256 startRequest; //todo: rename
-        Outcome oracle;
         Outcome proposedOutcome; // Outcome that the proposer submitted.
-        Outcome resolvedOutcome; // Outcome resolved once the request is settled.
         Outcome disputerOutcome;
         uint256 expirationTime; // Time at which the request auto-settles without a dispute..
-        State state;
+        address rewardToken;
         Side[2] sides;
-        uint256 muchId;
-        uint256 gameID;
     }
 
     mapping(bytes32 => Event) private events;
@@ -81,11 +99,7 @@ contract Oracle is IOracle, Ownable, ChainlinkClient {
      // Disputed and Outcome result is available.
      // Final Outcome been set in the contract (can get here from Expired or Resolved).
 
-     constructor(address _match, address _node, bytes32 _jobId, uint256 _nodeFee) {
-        setPublicChainlinkToken();
-        nodeOracle = _node;
-        jobId = _jobId;
-        nodeFee = _nodeFee; // (Varies by network and job)
+     constructor(address _match) {
         matchContract = IMatch(_match);
     }
     modifier onlyMatch() {
@@ -104,189 +118,173 @@ contract Oracle is IOracle, Ownable, ChainlinkClient {
     //     );
     //     _;
     // }
+ 
 
-    function getGameName(uint256 _gameId) internal pure returns(string memory) {
-        if(_gameId == LOL_ID) return 'lol';
-        if(_gameId == CS_ID) return 'csgo';
-        if(_gameId == DOTA_ID) return 'dota2';
-        return '';
-    }
-
-    function _getUrl(uint256 _gameId, uint256 _matchId) internal view returns(string memory) {
-        strings.slice[] memory parts = new strings.slice[](6);
-        parts[0] =  apiBase.toSlice();
-        parts[1] = getGameName(_gameId).toSlice();
-        parts[2] = '/matches?filter[id]='.toSlice();
-        parts[3] = uint2str(_matchId).toSlice();
-        parts[4] = '&token='.toSlice();
-        parts[5] = apiToken.toSlice();
-        return ''.toSlice().join(parts);
-    }
     
-    //To do onlyAdmin or operator
-    function getDataApi(string memory path, bytes32 _hashMarket) external payable {
-        //проверка на то, что маркет существует
-        //Market storage market = markets[_hashMarket];
-        //string memory url = generateUrl(path, market.gameId, market.matchId);
-        //json(https://api.pandascore.co//matches/csgo/matches?filter[id]=598397&token=V8tUE0DEJ4Dew5QjhAi5tbgtUaoqSfFLk1padL2RAK1U0ED3B1Q).0.[winner_id, rescheduled]
-        //bytes32 queryId = provable_query("URL", 'json(htts://api.pandascore.co/csgo/matches?filter[id]=598397&token=V8tUE0DEJ4Dew5QjhAi5tbgtUaoqSfFLk1padL2RAK1U0ED3B1Q).0.[winner_id, rescheduled, status]');
-        //requests[queryId] = _hashMarket;
-    }
-    
-    //  function split(string memory _string, uint256 _part) external view returns(string memory) {
-    //     strings.slice memory s  = _string.toSlice();
-    //     s.beyond("[".toSlice()).until("]".toSlice());
-    //     strings.slice memory separator = ",".toSlice();
-    //     string[] memory parts = new string[](s.count(separator) + 1);
-    //     for(uint i = 0; i < parts.length; i++) {
-    //         parts[i] = s.split(separator).toString();
-    //     }
-    //     return parts[_part]; 
-    // }
     function proposeOutcome(bytes32 _event, Outcome _outcome) external onlyOwner {
-        require(_outcome != Outcome.NONE);
-        require(_getState(_event) == State.Requested, "proposeOutcome: isn't requested");
+        require(events[_event].resolutionTime > 0, "proposeOutcome: isn't requested");
         Event storage e = events[_event];
         e.proposedOutcome = _outcome;
         e.expirationTime = block.timestamp + liveness;
-        //@todo: block fee
     
     }
 
-    function _callback(bytes32 _requestId, uint256 _teamId) public {
-        Event storage e = events[requests[_requestId]];
-        e.callback = true;
-        if(_teamId == e.sides[0].id) e.disputerIsRight = e.sides[0].outcome == e.disputerOutcome;            
-        if(_teamId == e.sides[1].id) e.disputerIsRight = e.sides[1].outcome == e.disputerOutcome;  
-         
-    }
-    function _callback(bytes32 _requestId, bool _draw) public {
-        Event storage e = events[requests[_requestId]];
-        e.callback = true;
-        e.disputerIsRight = _draw;
-    }
-    function _callback(bytes32 _requestId, bytes32 _status) public {
-        Event storage e = events[requests[_requestId]];
-        e.callback = true;
-        e.disputerIsRight = _status == CANCELED;
-    }
-
-    
     //disputeOutcome
-    function openDispute(bytes32 _event, Outcome _outcome) external payable {
-        require(_outcome != Outcome.NONE);
-        require(msg.value >= bond);
+    function _returnQuestion(Outcome _outcome, Side[2] memory _sides) public pure returns(bytes memory){
+            if(_outcome == Outcome.OUTCOME_ONE){
+                bool isFirst = _sides[0].outcome == Outcome.OUTCOME_ONE;
+                return bytes(abi.encodePacked("Did the the", isFirst ? _sides[0].name : _sides[1].name, 'beat the', isFirst ? _sides[1].name : _sides[0].name, 'January 6th, 2022?'));
+
+            }else if(_outcome == Outcome.OUTCOME_TWO){
+                bool isFirst = _sides[0].outcome == Outcome.OUTCOME_ONE;
+                return bytes(abi.encodePacked("Did the the", isFirst ? _sides[0].name : _sides[1].name, 'beat the', isFirst ? _sides[1].name : _sides[0].name, 'January 6th, 2022?'));
+            }else {
+                return bytes(abi.encodePacked("Did the ", _sides[0].name, 'draw VS the', _sides[1].name , 'January 6th, 2022?'));
+            }
+    }
+
+
+    function openDispute(bytes32 _event, Outcome _outcome) external {
+        Event memory e = events[_event];
         require(
-            _getState(_event) == State.Proposed,
+            _getState(_event) == State.ProposedOrExpired,
             "openDispute: isn't proposed"
         );
-        Event storage e = events[_event];
         require(_outcome != e.proposedOutcome);
-        //check whether the sender will be able to pay fee
-        //run the request
-        bytes32 requestId;
-        if(_outcome == Outcome.REVERT){
-            requestId = _makeRequest(e.gameID, e.muchId, jobId, bytes4(keccak256("_callback(bytes32,bytes32)")), path);
-        }else if(_outcome == Outcome.DRAW){
-            requestId = _makeRequest(e.gameID, e.muchId, jobId, bytes4(keccak256("_callback(bytes32,bool)")), path);
-        } else{
-            requestId = _makeRequest(e.gameID, e.muchId, jobId, bytes4(keccak256("_callback(bytes32,uint256)")), path);
-        }   
-       requests[requestId] = _event;
+        bytes memory question = _returnQuestion(_outcome, e.sides);
+        if(_outcome == Outcome.OUTCOME_ONE){
+            
+        }else if(_outcome == Outcome.OUTCOME_ONE){
+
+        }
+        _requestPrice(
+            msg.sender,
+            IDENTIFIER,
+            block.timestamp,
+            question,
+            e.rewardToken,
+            e.reward,
+            e.proposalBond
+
+        );
+       //requests[requestId] = _event;
     }
 
-    
-    function _makeRequest(
-        uint256 _gameId, 
-        uint256 _matchId, 
-        bytes32 _job, 
-        bytes4 _selector, 
-        string memory _path) internal returns (bytes32) {
-        Chainlink.Request memory request = buildChainlinkRequest(
-            _job, 
-            address(this),
-            _selector
-        );
-        
-        // Set the URL to perform the GET request on
-        request.add("get", _getUrl(_gameId, _matchId));
-        request.add("path", _path);
-        return sendChainlinkRequestTo(nodeOracle, request, nodeFee);
+    /// @notice Request a price from the Optimistic Oracle
+    /// @dev Transfers reward token from the requestor if non-zero reward is specified
+    function _requestPrice(
+        address requestor,
+        bytes32 priceIdentifier,
+        uint256 timestamp,
+        bytes memory ancillaryData,
+        address rewardToken,
+        uint256 reward,
+        uint256 bond
+    ) internal {
+        // Fetch the optimistic oracle
+        IOptimisticOracle optimisticOracle = getOptimisticOracle();
+
+        // If non-zero reward, pay for the price request by transferring rewardToken from the requestor
+        if (reward > 0) {
+            //TransferHelper.safeTransferFrom(rewardToken, requestor, address(this), reward);
+
+            // Approve the OO to transfer the reward token from the Adapter
+            if (IERC20(rewardToken).allowance(address(this), address(optimisticOracle)) < type(uint256).max) {
+                //TransferHelper.safeApprove(rewardToken, address(optimisticOracle), type(uint256).max);
+            }
+        }
+
+        // Send a price request to the Optimistic oracle
+        optimisticOracle.requestPrice(priceIdentifier, timestamp, ancillaryData, IERC20(rewardToken), reward);
+
+        // Update the proposal bond on the Optimistic oracle if necessary
+        if (bond > 0) {
+            optimisticOracle.setBond(priceIdentifier, timestamp, ancillaryData, bond);
+        }
     }
+
+
     
     function settleDispute(bytes32 _event) external {
-        Event storage e = events[_event];
-        e.settled = true;
-        //can open dispute on Draw Outcome 1 and Outcome 2
-
-        // if timeTx > 100 сек
-        //Outcome != set Outcome ? Outcome == OracleOutcome
-        //
-
-        //bool disputeSuccess = .resolvedPrice != request.proposedPrice;
-        //uint256 bond = request.bond;
-
-    }
-    function _checkOutcome(uint256 _teamId, Side[2] memory _sides) internal returns(Outcome) {
-        _teamId == _sides[0].id ? _sides[0].outcome : _teamId == _sides[1].id ? _sides[1].outcome : Outcome.REVERT;
-    }
-    function requestOutcome(bytes32 _event, Side[2] memory _sides) external override onlyMatch {
-        //TODO: check that the event does not exist yet 
-        Event storage e = events[_event];
-        e.state = State.Requested;
-        //e.sides = _sides;
-        //Requested = true;
-    }
-
-
-    function hasOutcome(bytes32 _event) external returns(bool) {
         State state = _getState(_event);
-        return state == State.Settled || state == State.Resolved || state == State.Expired;
+        Event storage e = events[_event];
+        //e.settled = true;
+        blockAmount -= pledge;
+        // if(state == State.Failed){
+        //     //compensation for open dispute
+        //     uint256 penalty = ((pledge * 1e16) / 1e18);
+        //     availableAmount += pledge - penalty;
+        //     (bool success, ) = e.disputer.call{value: pledge + penalty}("");
+        //     require(success); 
+        // } else if(state == State.Resolved) {
+        //     if(e.disputerIsRight){
+        //         (bool success, ) = e.disputer.call{value: pledge * 2}("");
+        //         require(success);
+        //     }else {
+        //         availableAmount += pledge * 2;
+        //     }
+        // } else {
+        //     revert("settleDispute: not settleable");
+        // }
+        //@todo: Event
+
     }
 
-    function getUrl() external {
+    //@TODO: add an event
+    function initializeEvent(
+        bytes32 _event, 
+        Side[2] memory _sides,
+        uint256 _estimatedStartTime
+        ) external override onlyMatch {
+        require(!(events[_event].estimatedStartTime > 0), "Adapter::initializeQuestion: Question already initialized");
+        require(_estimatedStartTime > 0, "Adapter::initializeQuestion: resolutionTime must be positive");
+        Event storage e = events[_event];
+        e.sides[0] = _sides[0];
+        e.sides[1] = _sides[1];
+        e.estimatedStartTime = _estimatedStartTime;
+    }
+
+    function hasResult(bytes32 _event) public override returns(bool){
 
     }
 
-    function uint2str(uint256 _i) internal pure returns (string memory str) {
-        if (_i == 0){
-            return "0";
-        }
-        uint256 j = _i;
-        uint256 length;
-        while (j != 0){
-            length++;
-            j /= 10;
-        }
-        bytes memory bstr = new bytes(length);
-        uint256 k = length;
-        j = _i;
-        while (j != 0) {
-            bstr[--k] = bytes1(uint8(48 + j % 10));
-            j /= 10;
-        }
-        str = string(bstr);
+
+    function getOutcome(bytes32 _event) external view returns(Outcome) {
+        //require(hasOutcome(_event), "getOutcome:Event hasn't outcome");
+        State state = _getState(_event);
+        Event storage e = events[_event];
+        // if(state == State.Expired){
+        //     return e.proposedOutcome;
+        // } else {
+        //     return e.disputerIsRight ? e.disputerOutcome : e.proposedOutcome;
+        // }
+
     }
+
+    function hasOutcome(bytes32 _event) public returns(bool) {
+        State state = _getState(_event);
+        return state == State.Resolved || state == State.Expired;
+    }
+
+    function getOptimisticOracleAddress() internal view returns (address) {
+        return IUmaFinder(umaFinder).getImplementationAddress("OptimisticOracle");
+    }
+
+    function getOptimisticOracle() internal view returns (IOptimisticOracle) {
+        return IOptimisticOracle(getOptimisticOracleAddress());
+    }
+
+
+    
     function _getState(
         bytes32 _event
     ) internal view returns (State) {
         Event storage e = events[_event];
-        if (e.muchId == 0) {
+        if(e.estimatedStartTime == 0){
             return State.None;
         }
-        if (e.proposedOutcome != Outcome.NONE) {
-            return State.Requested;
-        }
-        if (e.settled) {
-            return State.Settled;
-        }
-        if (e.disputer == address(0)) {
-            return e.expirationTime <= block.timestamp ? State.Expired : State.Proposed;
-        }
-        if(!e.callback){
-            return (e.startRequest + REQUEST_TIME) <= block.timestamp ? State.Failed : State.Disputed;
-        }
-        return State.Resolved;
+        // if(e.proposedTimestamp != 0){
+        //     return;
+        // }
     }
-
 } 

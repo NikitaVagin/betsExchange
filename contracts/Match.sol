@@ -9,15 +9,12 @@ import "hardhat/console.sol";
 contract Match is IMatch {
     struct Side {
         uint256 id;
-        Outcome outcome;
+        bytes name;
     }
 
     using strings for *;
     
     uint256 constant PCT_BASE = 1 ether;
-    string constant STATUS_FINISHED = 'finished';
-    string constant STATUS_CANCELED = 'canceled';
-    string constant STATUS_NOT_STARTED = 'canceled';
 
     event CreateMarket (bytes32 indexed hashMarket);
     event CreateOffer (bytes32 indexed hashOffer);
@@ -47,11 +44,14 @@ contract Match is IMatch {
     struct BetOffer {
         address creator;
         uint256[2] amounts; // 0 == Back 1 == lay
-        address[2] lastStakers; // 0 == Back, 1 == lay
+        address[2] lastStakers; // 0 == Backer 1 == Layer
+        uint256 backAmount;//???
+        uint256 layAmount;//???
         uint256 rate; //Do it need a library for decimals 
         uint256 matched; //amount of matched
         uint256 minAmount;
-        address lastStaker;
+        address lastBacker;
+        address lastLayer;
         uint256 takeCount;
         uint256 settleCount;
         Outcome outcome; //Is this necessary?
@@ -124,10 +124,7 @@ contract Match is IMatch {
     //     require(provable_getPrice('URL') < address(this).balance, 'not enough eth for request');
     //     _;
     // }
-    
-    function stringToUint(string memory _s) external pure returns(uint _return)   {
-        //_return = parseInt(_s);
-    }
+
     
    function submitOffer(Outcome _outcome, uint256 _rate, uint256 _minAmount, bytes32 _market) external payable{
         address sender = msg.sender;
@@ -147,7 +144,7 @@ contract Match is IMatch {
         offer.minAmount = _minAmount;
         offer.creator = sender;
         offer.rate = _rate;
-        offer.amounts[uint8(Stake.BACK)] = value;
+        offer.backAmount = value;
         balanceForStake[sender][offerHash][Stake.BACK] += value;
         offer.outcome = _outcome;
         offer.offerHash = offerHash;
@@ -158,13 +155,16 @@ contract Match is IMatch {
     function submitTake(Stake _stake, bytes32 _market, bytes32 _offer) external payable {
         address sender = msg.sender;
         uint256 value = msg.value;
+        bool isBack = _stake == Stake.BACK;
         require(exist[_market] && exist[_offer], 'not exist');
         uint256 i = indexOfOffers[_offer];
         BetOffer storage o = offers[_market][markets[_market].offers[i]];
-        require(_canTake(_stake, o.amounts), 'Cant submit take');
+        require(_canTake(_stake, o.backAmount, o.layAmount), 'Cant submit take');
         uint8 st = uint8(_stake);
         uint8 op = uint8(_stake == Stake.BACK ? Stake.LAY : Stake.BACK);
         o.amounts[uint8(_stake)] += msg.value;
+        isBack ? o.backAmount += msg.value : o.layAmount += msg.value;
+        
         o.matched = o.amounts[st] <= o.amounts[op] ? o.amounts[st] : o.amounts[op]; 
         o.takeCount +=1;
         _addOffer(msg.sender, _offer);
@@ -173,11 +173,8 @@ contract Match is IMatch {
         //should be made emit
     }
     //оптимизировать
-    function _canTake(Stake _stake, uint256[2] memory _amounts) internal pure returns(bool){
-        if(_stake == Stake.BACK){
-            return _amounts[uint8(Stake.BACK)] <= _amounts[uint8(Stake.LAY)] ? true : false;
-        }
-        return _amounts[uint8(Stake.LAY)] <= _amounts[uint8(Stake.BACK)] ? true : false;
+    function _canTake(Stake _stake, uint256 backAmount, uint256 layAmount) internal pure returns(bool){
+        return _stake == Stake.BACK ? backAmount <= layAmount : layAmount <= backAmount;
     }
 
     function _difference(uint256[2] memory _amounts) internal pure returns(uint256[2] memory diff) {
@@ -186,6 +183,7 @@ contract Match is IMatch {
         }else {
             diff[1] = (_amounts[1] - _amounts[0]);
         }
+        
     }
 
     // function _difference2(uint256[2] memory _amounts) internal pure returns(uint256) {
@@ -214,8 +212,8 @@ contract Match is IMatch {
         return keccak256(abi.encodePacked('take', _taker, _offerHash));
 
     }
-
-   function changeBetRate(uint betId) external {
+    
+   function changeBetRate(uint _event) external {
 
     }
 
@@ -226,7 +224,7 @@ contract Match is IMatch {
    function createMarket(Market memory _m) external {
         bytes32 hashM = marketHash(_m);
         require(markets[hashM].marketHash[0]== 0, 'Market already exists');
-        //_validateSides(_m.sides);
+        _validateSides(_m.sides);
         _m.marketHash = hashM;
         //TODO: Copying of type struct memory to storage not yet supported. 
         //markets[hashM] = _m;
@@ -237,10 +235,15 @@ contract Match is IMatch {
    function settleMarket(uint256 _betId, Outcome _variant, uint256 _amount) external {
 
    }
+   //calls in each of the public function 
+   function updateBetDataFromOracle(uint256 _betId) internal {
+       // if hasResult ? set the outcome result
+       //bool is = oracle.hasResult()
+   } 
 
    function _validateSides(Side[2] memory _sides) internal pure {
        require(_sides[0].id != _sides[1].id, 'identical team ids');
-       require(uint8(_sides[0].outcome) > 0 && uint8(_sides[1].outcome) > 0);
+       require(keccak256(_sides[0].name) != keccak256(_sides[1].name), 'identical team names');
    }
 
     function claimAll() external {
@@ -265,21 +268,23 @@ contract Match is IMatch {
        Market storage m = markets[_market];
        BetOffer storage o = offers[_market][_offer];
        require(uint8(m.status) > 1, 'incorrect time for claim');
+       uint256 backStaked = balanceForStake[msg.sender][_offer][Stake.BACK];
+       uint256 layStaked = balanceForStake[msg.sender][_offer][Stake.LAY];
        uint256 payout;
        uint256[2] memory diff;
+       // mismatch amount is return to last staker 
        if(m.status == Status.DECIDED){
-           if(o.lastStaker == msg.sender && o.amounts[0] != o.amounts[1]){
+           if(o.lastStakers[0] == msg.sender && o.amounts[0] != o.amounts[1]){
             diff = _difference(o.amounts);
             payout += diff[0] > 0 ? diff[0] : diff[1];
             }
-           if(m.outcome == o.outcome && balanceForStake[msg.sender][_offer][Stake.BACK] > 0){
-                uint256 bet = (balanceForStake[msg.sender][_offer][Stake.BACK] - diff[0]);
+           if(m.outcome == o.outcome && backStaked > 0){
+                uint256 bet = backStaked - diff[0];
                 payout += (bet * o.rate) / PCT_BASE;
-           }else if(balanceForStake[msg.sender][_offer][Stake.LAY] > 0){
-               uint256 bet = (balanceForStake[msg.sender][_offer][Stake.LAY] -  diff[1]);
+           }else if(layStaked > 0){
+               uint256 bet = layStaked -  diff[1];
                payout += (bet * ((o.rate * PCT_BASE) / (o.rate - PCT_BASE))) / PCT_BASE;
            }
-
        } else {
            payout = totalBalanceForOffer[msg.sender][_offer];
        }
@@ -293,6 +298,10 @@ contract Match is IMatch {
 
    function _validateMarket(Market memory _m) internal {
     //validate passed struct;
+   }
+
+   function executeOffer() external {
+       //@TODO: 
    }
 }
 

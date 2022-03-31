@@ -6,7 +6,13 @@ import "./IMatch.sol";
 interface IOracle is IMatch {
     struct Side {
         uint256 id;
+        bytes name;
         Outcome outcome;
     }
-    function requestOutcome(bytes32, Side[2] memory) external;
+    // struct Offer {
+        
+    // }
+    function initializeEvent(bytes32, Side[2] memory, uint256) external;
+
+    function hasResult(bytes32) external returns (bool);
 }
